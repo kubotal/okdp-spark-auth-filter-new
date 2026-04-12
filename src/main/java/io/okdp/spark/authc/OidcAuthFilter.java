@@ -45,7 +45,9 @@ import io.okdp.spark.authc.config.Constants;
 import io.okdp.spark.authc.config.HttpSecurityConfig;
 import io.okdp.spark.authc.config.OidcConfig;
 import io.okdp.spark.authc.exception.AuthenticationException;
+import io.okdp.spark.authc.exception.CipherException;
 import io.okdp.spark.authc.model.AccessToken;
+import io.okdp.spark.authc.model.AuthState;
 import io.okdp.spark.authc.model.PersistedToken;
 import io.okdp.spark.authc.model.WellKnownConfiguration;
 import io.okdp.spark.authc.provider.AuthProvider;
@@ -298,11 +300,22 @@ public class OidcAuthFilter implements Filter, Constants {
     }
 
     // Extract the access token from the http auth cookie if present
-    Optional<String> maybeAuthCookie =
-        HttpAuthenticationUtils.getCookieValue(AUTH_COOKE_NAME, servletRequest);
-    if (maybeAuthCookie.isPresent()) {
-      PersistedToken persistedToken =
-          authProvider.httpSecurityConfig().sessionStore().readToken(maybeAuthCookie.get());
+    Optional<PersistedToken> maybePersistedToken =
+        HttpAuthenticationUtils.getCookieValue(AUTH_COOKE_NAME, servletRequest)
+            .flatMap(
+                value -> {
+                  try {
+                    return Optional.of(
+                        authProvider.httpSecurityConfig().sessionStore().readToken(value));
+                  } catch (CipherException e) {
+                    log.warn(
+                        "Unable to decrypt auth cookie, forcing re-authentication: {}",
+                        e.getMessage());
+                    return Optional.empty();
+                  }
+                });
+    if (maybePersistedToken.isPresent()) {
+      PersistedToken persistedToken = maybePersistedToken.get();
 
       if (persistedToken.isExpired()) {
         AccessToken newAccessToken = null;
@@ -384,24 +397,38 @@ public class OidcAuthFilter implements Filter, Constants {
       // The previous redirect was maybe failed (prevent infinite loop)
       Try.of(() -> checkAuthLogin(servletRequest))
           .onException(e -> sendError(servletResponse, e.getHttpStatusCode(), e.getMessage()));
-      // Save the original URL in sessionStorage (per-tab, no multi-tab collision)
-      // before the auth provider writes its own redirect script
+      // Capture the original URL (path + query) so that, after the OIDC round-trip, the user is
+      // redirected back to the exact deep-link they first requested (e.g. /history/<appId>/jobs/).
+      // The return URL is carried inside the encrypted, short-lived state cookie next to the PKCE
+      // code_verifier, which is reliable across the cross-origin hop to the OIDC provider (unlike
+      // sessionStorage, which some browsers partition for cross-site navigations).
       HttpServletRequest httpReq = (HttpServletRequest) servletRequest;
       String originalUrl = httpReq.getRequestURI();
       if (httpReq.getQueryString() != null) {
         originalUrl += "?" + httpReq.getQueryString();
       }
-      servletResponse.setContentType("text/html;charset=UTF-8");
-      servletResponse
-          .getWriter()
-          .print(
-              String.format(
-                  "<script>try{sessionStorage.setItem('OKDP_RETURN_URL','%s')}catch(e){}</script>",
-                  originalUrl.replace("'", "\\'")));
-      authProvider.redirectUserToAuthorizationEndpoint(servletResponse);
+      authProvider.redirectUserToAuthorizationEndpoint(servletResponse, originalUrl);
     } else {
       // The user is authenticated and redirected by the oidc provider into the application with a
       // 'code' query parameter (?code=...)
+      // Read the original return URL from the state cookie BEFORE it gets cleared by
+      // requestAccessToken so we can redirect the user to their initial deep-link.
+      String returnUrl =
+          HttpAuthenticationUtils.getCookieValue(AUTH_STATE_COOKE_NAME, servletRequest)
+              .flatMap(
+                  value -> {
+                    try {
+                      return Optional.<AuthState>of(
+                          authProvider.httpSecurityConfig().sessionStore().readPKCEState(value));
+                    } catch (CipherException e) {
+                      log.warn("Unable to decrypt state cookie: {}", e.getMessage());
+                      return Optional.empty();
+                    }
+                  })
+              .map(AuthState::returnUrl)
+              .filter(u -> u != null && !u.isEmpty())
+              .orElse("/");
+
       // Exchange the obtained 'code' with an access token by issuing a request against the oidc
       // provider
       AccessToken accessToken =
@@ -433,17 +460,8 @@ public class OidcAuthFilter implements Filter, Constants {
       // Add the user and groups in the user/group mappings authorization cache
       OidcGroupMappingServiceProvider.addUserAndGroups(
           persistedToken.id(), persistedToken.userInfo().getGroupsAndRoles());
-      // Redirect to the original URL from sessionStorage (per-tab), fallback to current URI
-      servletResponse.setContentType("text/html;charset=UTF-8");
-      servletResponse
-          .getWriter()
-          .print(
-              "<script type=\"text/javascript\">"
-                  + "var u=sessionStorage.getItem('OKDP_RETURN_URL');"
-                  + "if(u){sessionStorage.removeItem('OKDP_RETURN_URL')}"
-                  + "window.location.href=u||'"
-                  + ((HttpServletRequest) servletRequest).getRequestURI().replace("'", "\\'")
-                  + "';</script>");
+      // Redirect to the original deep-link captured in the state cookie
+      ((HttpServletResponse) servletResponse).sendRedirect(returnUrl);
     }
   }
 
