@@ -384,8 +384,20 @@ public class OidcAuthFilter implements Filter, Constants {
       // The previous redirect was maybe failed (prevent infinite loop)
       Try.of(() -> checkAuthLogin(servletRequest))
           .onException(e -> sendError(servletResponse, e.getHttpStatusCode(), e.getMessage()));
-      // Redirect the user to the oidc provider to authenticate at the first time access to spark
-      // UI/History
+      // Save the original URL in sessionStorage (per-tab, no multi-tab collision)
+      // before the auth provider writes its own redirect script
+      HttpServletRequest httpReq = (HttpServletRequest) servletRequest;
+      String originalUrl = httpReq.getRequestURI();
+      if (httpReq.getQueryString() != null) {
+        originalUrl += "?" + httpReq.getQueryString();
+      }
+      servletResponse.setContentType("text/html;charset=UTF-8");
+      servletResponse
+          .getWriter()
+          .print(
+              String.format(
+                  "<script>try{sessionStorage.setItem('OKDP_RETURN_URL','%s')}catch(e){}</script>",
+                  originalUrl.replace("'", "\\'")));
       authProvider.redirectUserToAuthorizationEndpoint(servletResponse);
     } else {
       // The user is authenticated and redirected by the oidc provider into the application with a
@@ -421,15 +433,17 @@ public class OidcAuthFilter implements Filter, Constants {
       // Add the user and groups in the user/group mappings authorization cache
       OidcGroupMappingServiceProvider.addUserAndGroups(
           persistedToken.id(), persistedToken.userInfo().getGroupsAndRoles());
-      // Redirect the user from the browser (client) side into spark/history UI home page (i.e.
-      // remove the authz 'code' from the browser)
+      // Redirect to the original URL from sessionStorage (per-tab), fallback to current URI
       servletResponse.setContentType("text/html;charset=UTF-8");
       servletResponse
           .getWriter()
           .print(
-              String.format(
-                  "<script type=\"text/javascript\">window.location.href = '%s'</script>",
-                  ((HttpServletRequest) servletRequest).getRequestURI()));
+              "<script type=\"text/javascript\">"
+                  + "var u=sessionStorage.getItem('OKDP_RETURN_URL');"
+                  + "if(u){sessionStorage.removeItem('OKDP_RETURN_URL')}"
+                  + "window.location.href=u||'"
+                  + ((HttpServletRequest) servletRequest).getRequestURI().replace("'", "\\'")
+                  + "';</script>");
     }
   }
 

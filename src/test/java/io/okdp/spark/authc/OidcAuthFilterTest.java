@@ -136,14 +136,18 @@ public class OidcAuthFilterTest implements Constants, CommonTest {
     HttpServletRequest request = mock(HttpServletRequest.class);
     HttpServletResponse response = mock(HttpServletResponse.class);
     FilterChain chain = mock(FilterChain.class);
+    StringWriter out = new StringWriter();
+    when(response.getWriter()).thenReturn(new PrintWriter(out));
     when(request.getRequestURI()).thenReturn("/home");
 
     // When
     oidcAuthFilter.doFilter(request, response, chain);
 
     // Then - Redirect the user to login and callback with the authz code
-    ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
     verify(chain, never()).doFilter(request, response);
+    // Verify sessionStorage save script is in the output
+    assertThat(out.toString()).contains("sessionStorage.setItem('OKDP_RETURN_URL','/home')");
+    ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
     verify(response).sendRedirect(captor.capture());
     assertEquals(
         format(
@@ -182,9 +186,10 @@ public class OidcAuthFilterTest implements Constants, CommonTest {
             .readToken(captor.getValue().getValue());
     assertNotNull(persistedToken);
 
-    // Then
+    // Then - verify sessionStorage-based redirect with fallback to requestURI
     assertThat(out.toString())
-        .isEqualTo("<script type=\"text/javascript\">window.location.href = '/home'</script>");
+        .contains("sessionStorage.getItem('OKDP_RETURN_URL')")
+        .contains("window.location.href=u||'/home'");
   }
 
   @Test
